@@ -64,7 +64,6 @@ typedef struct rtlsdr_tuner_iface {
 	int (*set_gain)(void *, int gain /* tenth dB */);
 	int (*set_if_gain)(void *, int stage, int gain /* tenth dB */);
 	int (*set_gain_mode)(void *, int manual);
-	int (*set_if_freq)(void *, uint32_t freq /* Hz */);
 } rtlsdr_tuner_iface_t;
 
 enum rtlsdr_async_status {
@@ -114,6 +113,7 @@ struct rtlsdr_dev {
 	rtlsdr_tuner_iface_t *tuner;
 	uint32_t tun_xtal; /* Hz */
 	uint32_t freq; /* Hz */
+	uint32_t bw;
 	uint32_t offs_freq; /* Hz */
 	int corr; /* ppm */
 	int gain; /* tenth dB */
@@ -124,11 +124,10 @@ struct rtlsdr_dev {
 	int dev_lost;
 	int driver_active;
 	unsigned int xfer_errors;
-	int tuner_initialized;
-	int i2c_repeater_on;
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
+static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq);
 
 /* generic tuner interface functions, shall be moved to the tuner implementations */
 int e4000_init(void *dev) {
@@ -243,13 +242,16 @@ int r820t_set_freq(void *dev, uint32_t freq) {
 }
 
 int r820t_set_bw(void *dev, int bw) {
+	int r;
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
-	return r82xx_set_bw(&devt->r82xx_p, bw);
-}
 
-int r820t_set_if_freq(void *dev, uint32_t freq) {
-	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
-	return r82xx_set_if_freq(&devt->r82xx_p, freq);
+	r = r82xx_set_bandwidth(&devt->r82xx_p, bw, devt->rate);
+	if(r < 0)
+		return r;
+	r = rtlsdr_set_if_freq(devt, r);
+	if (r)
+		return r;
+	return rtlsdr_set_center_freq(devt, devt->freq);
 }
 
 int r820t_set_gain(void *dev, int gain) {
@@ -264,37 +266,37 @@ int r820t_set_gain_mode(void *dev, int manual) {
 /* definition order must match enum rtlsdr_tuner */
 static rtlsdr_tuner_iface_t tuners[] = {
 	{
-		NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL /* dummy for unknown tuners */
+		NULL, NULL, NULL, NULL, NULL, NULL, NULL /* dummy for unknown tuners */
 	},
 	{
 		e4000_init, e4000_exit,
 		e4000_set_freq, e4000_set_bw, e4000_set_gain, e4000_set_if_gain,
-		e4000_set_gain_mode, NULL
+		e4000_set_gain_mode
 	},
 	{
 		_fc0012_init, fc0012_exit,
 		fc0012_set_freq, fc0012_set_bw, _fc0012_set_gain, NULL,
-		fc0012_set_gain_mode, NULL
+		fc0012_set_gain_mode
 	},
 	{
 		_fc0013_init, fc0013_exit,
 		fc0013_set_freq, fc0013_set_bw, _fc0013_set_gain, NULL,
-		fc0013_set_gain_mode, NULL
+		fc0013_set_gain_mode
 	},
 	{
 		fc2580_init, fc2580_exit,
 		_fc2580_set_freq, fc2580_set_bw, fc2580_set_gain, NULL,
-		fc2580_set_gain_mode, NULL
+		fc2580_set_gain_mode
 	},
 	{
 		r820t_init, r820t_exit,
 		r820t_set_freq, r820t_set_bw, r820t_set_gain, NULL,
-		r820t_set_gain_mode, r820t_set_if_freq
+		r820t_set_gain_mode
 	},
 	{
 		r820t_init, r820t_exit,
 		r820t_set_freq, r820t_set_bw, r820t_set_gain, NULL,
-		r820t_set_gain_mode, r820t_set_if_freq
+		r820t_set_gain_mode
 	},
 };
 
@@ -327,6 +329,7 @@ static rtlsdr_dongle_t known_devices[] = {
 	{ 0x0ccd, 0x00e0, "Terratec NOXON DAB/DAB+ USB dongle (rev 2)" },
 	{ 0x1554, 0x5020, "PixelView PV-DT235U(RN)" },
 	{ 0x15f4, 0x0131, "Astrometa DVB-T/DVB-T2" },
+	{ 0x15f4, 0x0133, "HanfTek DAB+FM+DVB-T" },
 	{ 0x185b, 0x0620, "Compro Videomate U620F"},
 	{ 0x185b, 0x0650, "Compro Videomate U650F"},
 	{ 0x185b, 0x0680, "Compro Videomate U680F"},
@@ -574,10 +577,6 @@ void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 
 void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 {
-	if (on == dev->i2c_repeater_on)
-		return;
-	on = !!on; /* values +2 to force on */
-	dev->i2c_repeater_on = on;
 	rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1);
 }
 
@@ -675,13 +674,10 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 	if (!dev)
 		return -1;
 
-	rtlsdr_set_i2c_repeater(dev, 0);
-
 	if (dev->tuner && dev->tuner->exit) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->exit(dev); /* deinitialize tuner */
 		rtlsdr_set_i2c_repeater(dev, 0);
-		dev->tuner_initialized = 0;
 	}
 
 	/* poweroff demodulator and ADCs */
@@ -690,7 +686,7 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 	return r;
 }
 
-int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
+static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 {
 	uint32_t rtl_xtal;
 	int32_t if_freq;
@@ -699,13 +695,12 @@ int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	/* read corrected clock value */
 	if (rtlsdr_get_xtal_freq(dev, &rtl_xtal, NULL))
 		return -2;
 
-	if_freq = (int32_t)(((freq * TWO_POW(22)) / rtl_xtal) * -1);
+	if_freq = ((freq * TWO_POW(22)) / rtl_xtal) * (-1);
 
 	tmp = (if_freq >> 16) & 0x3f;
 	r = rtlsdr_demod_write_reg(dev, 1, 0x19, tmp, 1);
@@ -714,13 +709,6 @@ int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 	tmp = if_freq & 0xff;
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x1b, tmp, 1);
 
-	/* Tell the R820T driver which IF frequency we are currently using
-	 * so that it can choose the optimal IF filter settings.
-	 * Works for normal tuning as well as no-mod direct sampling! */
-	if(dev->tuner_initialized && dev->tuner && dev->tuner->set_if_freq) {
-		rtlsdr_set_i2c_repeater(dev, 1);
-		dev->tuner->set_if_freq(dev, freq);
-	}
 	return r;
 }
 
@@ -728,8 +716,7 @@ int rtlsdr_set_sample_freq_correction(rtlsdr_dev_t *dev, int ppm)
 {
 	int r = 0;
 	uint8_t tmp;
-	int16_t offs = (int16_t)(ppm * -1 * TWO_POW(24) / 1000000);
-	rtlsdr_set_i2c_repeater(dev, 0);
+	int16_t offs = ppm * (-1) * TWO_POW(24) / 1000000;
 
 	tmp = offs & 0xff;
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x3f, tmp, 1);
@@ -742,7 +729,6 @@ int rtlsdr_set_sample_freq_correction(rtlsdr_dev_t *dev, int ppm)
 int rtlsdr_set_xtal_freq(rtlsdr_dev_t *dev, uint32_t rtl_freq, uint32_t tuner_freq)
 {
 	int r = 0;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	if (!dev)
 		return -1;
@@ -840,7 +826,6 @@ int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16
 	int r = 0;
 	int i;
 	uint8_t cmd[2];
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	if (!dev)
 		return -1;
@@ -878,7 +863,6 @@ int rtlsdr_read_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_
 {
 	int r = 0;
 	int i;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	if (!dev)
 		return -1;
@@ -908,11 +892,11 @@ int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq)
 		return -1;
 
 	if (dev->direct_sampling) {
-		rtlsdr_set_i2c_repeater(dev, 0);
 		r = rtlsdr_set_if_freq(dev, freq);
 	} else if (dev->tuner && dev->tuner->set_freq) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_freq(dev, freq - dev->offs_freq);
+		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
 	if (!r)
@@ -934,7 +918,6 @@ uint32_t rtlsdr_get_center_freq(rtlsdr_dev_t *dev)
 int rtlsdr_set_freq_correction(rtlsdr_dev_t *dev, int ppm)
 {
 	int r = 0;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	if (!dev)
 		return -1;
@@ -1027,6 +1010,24 @@ int rtlsdr_get_tuner_gains(rtlsdr_dev_t *dev, int *gains)
 	}
 }
 
+int rtlsdr_set_tuner_bandwidth(rtlsdr_dev_t *dev, uint32_t bw)
+{
+	int r = 0;
+
+	if (!dev || !dev->tuner)
+		return -1;
+
+	if (dev->tuner->set_bw) {
+		rtlsdr_set_i2c_repeater(dev, 1);
+		r = dev->tuner->set_bw(dev, bw > 0 ? bw : dev->rate);
+		rtlsdr_set_i2c_repeater(dev, 0);
+		if (r)
+			return r;
+		dev->bw = bw;
+	}
+	return r;
+}
+
 int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 {
 	int r = 0;
@@ -1037,6 +1038,7 @@ int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 	if (dev->tuner->set_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain((void *)dev, gain);
+		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
 	if (!r)
@@ -1065,6 +1067,7 @@ int rtlsdr_set_tuner_if_gain(rtlsdr_dev_t *dev, int stage, int gain)
 	if (dev->tuner->set_if_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_if_gain(dev, stage, gain);
+		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
 	return r;
@@ -1080,6 +1083,7 @@ int rtlsdr_set_tuner_gain_mode(rtlsdr_dev_t *dev, int mode)
 	if (dev->tuner->set_gain_mode) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain_mode((void *)dev, mode);
+		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
 	return r;
@@ -1094,7 +1098,6 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	/* check if the rate is supported by the resampler */
 	if ((samp_rate <= 225000) || (samp_rate > 3200000) ||
@@ -1103,7 +1106,7 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 		return -EINVAL;
 	}
 
-	rsamp_ratio = (uint32_t)((dev->rtl_xtal * TWO_POW(22)) / samp_rate);
+	rsamp_ratio = (dev->rtl_xtal * TWO_POW(22)) / samp_rate;
 	rsamp_ratio &= 0x0ffffffc;
 
 	real_rsamp_ratio = rsamp_ratio | ((rsamp_ratio & 0x08000000) << 1);
@@ -1112,13 +1115,13 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 	if ( ((double)samp_rate) != real_rate )
 		fprintf(stderr, "Exact sample rate is: %f Hz\n", real_rate);
 
+	dev->rate = (uint32_t)real_rate;
+
 	if (dev->tuner && dev->tuner->set_bw) {
 		rtlsdr_set_i2c_repeater(dev, 1);
-		dev->tuner->set_bw(dev, (int)real_rate);
+		dev->tuner->set_bw(dev, dev->bw > 0 ? dev->bw : dev->rate);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
-
-	dev->rate = (uint32_t)real_rate;
 
 	tmp = (rsamp_ratio >> 16);
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x9f, tmp, 2);
@@ -1150,7 +1153,6 @@ int rtlsdr_set_testmode(rtlsdr_dev_t *dev, int on)
 {
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x03 : 0x05, 1);
 }
@@ -1159,7 +1161,6 @@ int rtlsdr_set_agc_mode(rtlsdr_dev_t *dev, int on)
 {
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x25 : 0x05, 1);
 }
@@ -1171,40 +1172,13 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 	if (!dev)
 		return -1;
 
-	/* set up normal direct sampling */
-	if (on == 1 || on == 2) {
+	if (on) {
 		if (dev->tuner && dev->tuner->exit) {
 			rtlsdr_set_i2c_repeater(dev, 1);
 			r = dev->tuner->exit(dev);
 			rtlsdr_set_i2c_repeater(dev, 0);
-			dev->tuner_initialized = 0;
 		}
-	}
 
-	/* set up no-mod direct sampling */
-	if (on == 3 && dev->tuner) {
-		if (dev->tuner_type == RTLSDR_TUNER_E4000) {
-			fprintf(stderr, "Tuning E4000 to 3708 MHz\n");
-			rtlsdr_set_i2c_repeater(dev, 1);
-			dev->tuner->init(dev);
-			dev->tuner_initialized = 1;
-			dev->tuner->set_freq(dev, 3708000000u);
-			e4000_set_bw(dev, 15000000);
-			rtlsdr_set_i2c_repeater(dev, 0);
-		}
-		if (dev->tuner_type == RTLSDR_TUNER_R820T) {
-			rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
-			rtlsdr_set_i2c_repeater(dev, 1);
-			dev->tuner->init(dev);
-			dev->tuner_initialized = 1;
-			r82xx_set_nomod(&devt->r82xx_p);
-			rtlsdr_set_i2c_repeater(dev, 0);
-		}
-	}
-	rtlsdr_set_i2c_repeater(dev, 0);
-
-	/* common to all direct modes */
-	if (on) {
 		/* disable Zero-IF mode */
 		r |= rtlsdr_demod_write_reg(dev, 1, 0xb1, 0x1a, 1);
 
@@ -1215,24 +1189,20 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 		r |= rtlsdr_demod_write_reg(dev, 0, 0x08, 0x4d, 1);
 
 		/* swap I and Q ADC, this allows to select between two inputs */
-		r |= rtlsdr_demod_write_reg(dev, 0, 0x06, (on == 2) ? 0x90 : 0x80, 1);
+		r |= rtlsdr_demod_write_reg(dev, 0, 0x06, (on > 1) ? 0x90 : 0x80, 1);
 
 		fprintf(stderr, "Enabled direct sampling mode, input %i\n", on);
 		dev->direct_sampling = on;
-	}
-
-	/* disable direct sampling */
-	if (!on) {
+	} else {
 		if (dev->tuner && dev->tuner->init) {
 			rtlsdr_set_i2c_repeater(dev, 1);
 			r |= dev->tuner->init(dev);
 			rtlsdr_set_i2c_repeater(dev, 0);
-			dev->tuner_initialized = 1;
 		}
 
 		if ((dev->tuner_type == RTLSDR_TUNER_R820T) ||
 		    (dev->tuner_type == RTLSDR_TUNER_R828D)) {
-			r |= rtlsdr_set_if_freq(dev, R82XX_DEFAULT_IF_FREQ);
+			r |= rtlsdr_set_if_freq(dev, R82XX_IF_FREQ);
 
 			/* enable spectrum inversion */
 			r |= rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
@@ -1269,7 +1239,7 @@ int rtlsdr_get_direct_sampling(rtlsdr_dev_t *dev)
 int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 {
 	int r = 0;
-	rtlsdr_set_i2c_repeater(dev, 0);
+	int bw;
 
 	if (!dev)
 		return -1;
@@ -1287,7 +1257,14 @@ int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 
 	if (dev->tuner && dev->tuner->set_bw) {
 		rtlsdr_set_i2c_repeater(dev, 1);
-		dev->tuner->set_bw(dev, on ? (2 * dev->offs_freq) : dev->rate);
+		if (on) {
+			bw = 2 * dev->offs_freq;
+		} else if (dev->bw > 0) {
+			bw = dev->bw;
+		} else {
+			bw = dev->rate;
+		}
+		dev->tuner->set_bw(dev, bw);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
@@ -1303,14 +1280,6 @@ int rtlsdr_get_offset_tuning(rtlsdr_dev_t *dev)
 		return -1;
 
 	return (dev->offs_freq) ? 1 : 0;
-}
-
-int rtlsdr_set_dithering(rtlsdr_dev_t *dev, int dither)
-{
-	if (dev->tuner_type == RTLSDR_TUNER_R820T) {
-		return r82xx_set_dither(&dev->r82xx_p, dither);
-	}
-	return 1;
 }
 
 static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
@@ -1330,14 +1299,16 @@ static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
 
 uint32_t rtlsdr_get_device_count(void)
 {
-	int i;
+	int i,r;
 	libusb_context *ctx;
 	libusb_device **list;
 	uint32_t device_count = 0;
 	struct libusb_device_descriptor dd;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return 0;
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1357,7 +1328,7 @@ uint32_t rtlsdr_get_device_count(void)
 
 const char *rtlsdr_get_device_name(uint32_t index)
 {
-	int i;
+	int i,r;
 	libusb_context *ctx;
 	libusb_device **list;
 	struct libusb_device_descriptor dd;
@@ -1365,7 +1336,9 @@ const char *rtlsdr_get_device_name(uint32_t index)
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return "";
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1405,7 +1378,9 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return r;
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1479,7 +1454,11 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	memset(dev, 0, sizeof(rtlsdr_dev_t));
 	memcpy(dev->fir, fir_default, sizeof(fir_default));
 
-	libusb_init(&dev->ctx);
+	r = libusb_init(&dev->ctx);
+	if(r < 0){
+		free(dev);
+		return -1;
+	}
 
 	dev->dev_lost = 1;
 
@@ -1624,7 +1603,7 @@ found:
 
 		/* the R82XX use 3.57 MHz IF for the DVB-T 6 MHz mode, and
 		 * 4.57 MHz for the 8 MHz mode */
-		rtlsdr_set_if_freq(dev, R82XX_DEFAULT_IF_FREQ);
+		rtlsdr_set_if_freq(dev, R82XX_IF_FREQ);
 
 		/* enable spectrum inversion */
 		rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
@@ -1637,11 +1616,8 @@ found:
 		break;
 	}
 
-	if (dev->tuner->init) {
-		rtlsdr_set_i2c_repeater(dev, 1);
+	if (dev->tuner->init)
 		r = dev->tuner->init(dev);
-		dev->tuner_initialized = 1;
-	}
 
 	rtlsdr_set_i2c_repeater(dev, 0);
 
@@ -1663,7 +1639,6 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
 {
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	if(!dev->dev_lost) {
 		/* block until all async operations have been completed (if any) */
@@ -1702,7 +1677,6 @@ int rtlsdr_reset_buffer(rtlsdr_dev_t *dev)
 {
 	if (!dev)
 		return -1;
-	rtlsdr_set_i2c_repeater(dev, 0);
 
 	rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x1002, 2);
 	rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x0000, 2);
@@ -1853,7 +1827,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 
 		r = libusb_submit_transfer(dev->xfer[i]);
 		if (r < 0) {
-			fprintf(stderr, "Failed to submit transfer %u!\n", i);
+			fprintf(stderr, "Failed to submit transfer %i!\n", i);
 			dev->async_status = RTLSDR_CANCELING;
 			break;
 		}
@@ -1950,32 +1924,16 @@ uint32_t rtlsdr_get_tuner_clock(void *dev)
 
 int rtlsdr_i2c_write_fn(void *dev, uint8_t addr, uint8_t *buf, int len)
 {
-	int r;
-	int retries = 2;
-	if (!dev)
-		return -1;
-	do {
-		r = rtlsdr_i2c_write(((rtlsdr_dev_t *)dev), addr, buf, len);
-		if (r >= 0)
-		    return r;
-		rtlsdr_set_i2c_repeater(dev, 2);
-		retries--;
-	} while (retries > 0);
+	if (dev)
+		return rtlsdr_i2c_write(((rtlsdr_dev_t *)dev), addr, buf, len);
+
 	return -1;
 }
 
 int rtlsdr_i2c_read_fn(void *dev, uint8_t addr, uint8_t *buf, int len)
 {
-	int r;
-	int retries = 2;
-	if (!dev)
-		return -1;
-	do {
-		r = rtlsdr_i2c_read(((rtlsdr_dev_t *)dev), addr, buf, len);
-		if (r >= 0)
-		    return r;
-		rtlsdr_set_i2c_repeater(dev, 2);
-		retries--;
-	} while (retries > 0);
+	if (dev)
+		return rtlsdr_i2c_read(((rtlsdr_dev_t *)dev), addr, buf, len);
+
 	return -1;
 }
