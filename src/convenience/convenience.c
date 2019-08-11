@@ -42,7 +42,7 @@ double atofs(char *s)
 	char last;
 	int len;
 	double suff = 1.0;
-	len = strlen(s);
+	len = (int)strlen(s);
 	last = s[len-1];
 	s[len-1] = '\0';
 	switch (last) {
@@ -71,7 +71,7 @@ double atoft(char *s)
 	char last;
 	int len;
 	double suff = 1.0;
-	len = strlen(s);
+	len = (int)strlen(s);
 	last = s[len-1];
 	s[len-1] = '\0';
 	switch (last) {
@@ -99,7 +99,7 @@ double atofp(char *s)
 	char last;
 	int len;
 	double suff = 1.0;
-	len = strlen(s);
+	len = (int)strlen(s);
 	last = s[len-1];
 	s[len-1] = '\0';
 	switch (last) {
@@ -291,7 +291,7 @@ int verbose_device_search(char *s)
 	/* does string suffix match a serial */
 	for (i = 0; i < device_count; i++) {
 		rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-		offset = strlen(serial) - strlen(s);
+		offset = (int)strlen(serial) - (int)strlen(s);
 		if (offset < 0) {
 			continue;}
 		if (strncmp(s, serial+offset, strlen(s)) != 0) {

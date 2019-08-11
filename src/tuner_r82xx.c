@@ -419,7 +419,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	int rc, i;
 	unsigned sleep_time = 10000;
 	uint64_t vco_freq;
-	uint32_t vco_fra;	/* VCO contribution by SDM (kHz) */
+	uint64_t vco_fra;	/* VCO contribution by SDM (kHz) */
 	uint32_t vco_min = 1770000;
 	uint32_t vco_max = vco_min * 2;
 	uint32_t freq_khz, pll_ref, pll_ref_khz;
@@ -486,7 +486,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 	vco_freq = (uint64_t)freq * (uint64_t)mix_div;
 	nint = vco_freq / (2 * pll_ref);
-	vco_fra = (vco_freq - 2 * pll_ref * nint) / 1000;
+	vco_fra = (uint32_t)((vco_freq - 2 * pll_ref * nint) / 1000);
 
 	if (nint > ((128 / vco_power_ref) - 1)) {
 		fprintf(stderr, "[R82XX] No valid PLL values for %u Hz!\n", freq);
